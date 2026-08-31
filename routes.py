@@ -24,6 +24,17 @@ from .nodes import (
 
 routes = PromptServer.instance.routes
 
+# Applied to every route that serves image/video bytes by path. Without
+# this, the browser's own HTTP cache can serve stale bytes for a path
+# whose on-disk content has since changed (e.g. the same source_path
+# overwritten by an external re-render) — same fix applied to
+# ComfyUI-VFX-Write's equivalent routes after a real reported bug: the
+# path/version UI updated correctly, but the canvas kept showing the old
+# image. The app already does its own smarter, path+frame-keyed in-memory
+# caching (see cacheRequest in the frontend) for scrub performance, so
+# disabling the browser's own opportunistic caching here has no real cost.
+_NO_STORE_HEADERS = {"Cache-Control": "no-store"}
+
 
 # /vfx-read/thumbnail and /vfx-read/image both decode images (and, for
 # movies, spawn a blocking ffmpeg subprocess via _read_movie_frame) — real
@@ -103,8 +114,11 @@ def _group_files(folder):
 
         # Mirrors _sequence_info's own version-vs-sequence cutoff — a
         # 1-2 digit trailing number is a version token (v01, v02...), not
-        # a frame number.
-        if padding < 3:
+        # a frame number; more than 8 digits is a paste-from-clipboard
+        # upload's Date.now() timestamp (pasted_<13 digits>.png), not a
+        # real frame number either — see the design note on _sequence_info
+        # for the live-confirmed bug this excludes.
+        if padding < 3 or padding > 8:
             standalone.append(item)
             continue
 
@@ -211,13 +225,14 @@ async def list_folder(request):
 @routes.get("/vfx-read/inspect")
 async def inspect(request):
     source = request.query.get("path", "").strip()
+    force_still = request.query.get("force_still", "").strip() not in ("", "0")
 
     # inspect_source() spawns a blocking ffprobe subprocess for movies
     # (_movie_info) — the exact same event-loop-blocking problem as the
     # thumbnail/image/list routes above, just missed in that first pass.
     # This one is called on every single file pick, before any thumbnail
     # is even fetched — confirmed as the still-remaining freeze source.
-    result = await run_in_executor(inspect_source, source)
+    result = await run_in_executor(inspect_source, source, force_still)
 
     return web.json_response(result)
 
@@ -267,6 +282,7 @@ async def thumbnail(request):
     return web.Response(
         body=png_bytes,
         content_type="image/png",
+        headers=_NO_STORE_HEADERS,
     )
 
 
@@ -285,13 +301,13 @@ async def image(request):
     if kind == "file":
         if is_web_displayable_image(payload):
             # Raw passthrough — faster, and exact original quality.
-            return web.FileResponse(payload)
+            return web.FileResponse(payload, headers=_NO_STORE_HEADERS)
 
         png_bytes = await run_in_executor(full_image_png, payload)
-        return web.Response(body=png_bytes, content_type="image/png")
+        return web.Response(body=png_bytes, content_type="image/png", headers=_NO_STORE_HEADERS)
 
     png_bytes = await run_in_executor(_tensor_to_png_bytes, payload)
-    return web.Response(body=png_bytes, content_type="image/png")
+    return web.Response(body=png_bytes, content_type="image/png", headers=_NO_STORE_HEADERS)
 
 
 @routes.get("/vfx-read/video")
@@ -305,7 +321,7 @@ async def video(request):
 
     # FileResponse supports HTTP Range requests, which <video> needs for
     # seeking/scrubbing.
-    return web.FileResponse(source)
+    return web.FileResponse(source, headers=_NO_STORE_HEADERS)
 
 
 _UPLOAD_DIR_GETTERS = {

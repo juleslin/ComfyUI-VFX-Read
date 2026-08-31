@@ -1378,11 +1378,11 @@ function prefetchAround(node, state, src, frame) {
 // applyRange === true  : adopt the file's range (new source picked)
 // applyRange === false : keep saved range, clamp it to the file (reload)
 
-async function inspectAndApply(node, path, applyRange = true) {
+async function inspectAndApply(node, path, applyRange = true, forceStill = false) {
   const state = node.__vfxPreview;
   let info;
   try {
-    info = await apiGet("/vfx-read/inspect", { path });
+    info = await apiGet("/vfx-read/inspect", { path, force_still: forceStill ? 1 : undefined });
   } catch (e) {
     console.warn("VFX Read inspect failed", e);
     return;
@@ -2198,7 +2198,15 @@ function onSourcePathChanged(node, v) {
     state.img = null;
   }
   if (v) {
-    inspectAndApply(node, String(v), true);
+    // Consumed here rather than passed as a direct argument: source_path
+    // changes funnel through this single dispatch point (typing, browse
+    // pick, paste, restore) via setWidget's own change detection, so a
+    // transient per-node flag is how the paste path — the only caller
+    // that wants force_still — signals its intent without a second,
+    // racing inspectAndApply call. See registerPasteListener.
+    const forceStill = !!node.__vfxForceStillNextInspect;
+    node.__vfxForceStillNextInspect = false;
+    inspectAndApply(node, String(v), true, forceStill);
   } else {
     if (state) {
       teardownVideo(node, state);
@@ -2266,42 +2274,67 @@ function registerPasteListener() {
   if (vfxReadPasteListenerRegistered) return;
   vfxReadPasteListenerRegistered = true;
 
-  document.addEventListener("paste", async (e) => {
-    // Don't hijack normal text paste — typing/pasting into the file path
-    // field itself (or any other input on the page) should behave
-    // normally. Only an image paste while a Read node is selected (and
-    // no text field has focus) gets intercepted.
-    const active = document.activeElement;
-    if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable)) {
-      return;
-    }
-
-    const node = findSelectedReadNode();
-    if (!node) return;
-
-    const items = e.clipboardData?.items;
-    if (!items) return;
-
-    let imageItem = null;
-    for (const item of items) {
-      if (item.type && item.type.startsWith("image/")) {
-        imageItem = item;
-        break;
+  // Capture phase, not bubble: ComfyUI core has its own paste handler
+  // that creates a "Load Image" node from clipboard image data (attached
+  // somewhere in the canvas/app layer, not necessarily document itself).
+  // A bubble-phase listener on document fires AFTER any listener lower in
+  // the tree has already run — confirmed live, this was exactly why a
+  // stray LoadImage node kept appearing alongside the intended paste into
+  // Read: preventDefault() alone was always too late. The capture phase
+  // fires top-down, before any bubble-phase listener anywhere below,
+  // guaranteeing this one sees the event first regardless of where
+  // core's own listener lives — stopImmediatePropagation() (called
+  // synchronously, before the async upload starts) then reliably stops
+  // it from ever running.
+  document.addEventListener(
+    "paste",
+    (e) => {
+      // Don't hijack normal text paste — typing/pasting into the file
+      // path field itself (or any other input on the page) should
+      // behave normally. Only an image paste while a Read node is
+      // selected (and no text field has focus) gets intercepted.
+      const active = document.activeElement;
+      if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable)) {
+        return;
       }
-    }
-    if (!imageItem) return;
 
-    e.preventDefault();
-    const blob = imageItem.getAsFile();
-    if (!blob) return;
+      const node = findSelectedReadNode();
+      if (!node) return;
 
-    try {
-      const path = await uploadPastedImage(blob);
-      setWidget(node, "source_path", path);
-    } catch (err) {
-      console.error("VFX Read: paste-image upload failed", err);
-    }
-  });
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      let imageItem = null;
+      for (const item of items) {
+        if (item.type && item.type.startsWith("image/")) {
+          imageItem = item;
+          break;
+        }
+      }
+      if (!imageItem) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+
+      const blob = imageItem.getAsFile();
+      if (!blob) return;
+
+      uploadPastedImage(blob)
+        .then((path) => {
+          // Pasted uploads all land in ComfyUI's shared input/ folder as
+          // pasted_<timestamp>.png — two pastes made moments apart share
+          // the exact filename shape sequence auto-detection groups by,
+          // so without this a second paste got the first treated as
+          // "frame 1 of 2" instead of two separate stills. See
+          // onSourcePathChanged/inspectAndApply's force_still plumbing.
+          node.__vfxForceStillNextInspect = true;
+          setWidget(node, "source_path", path);
+        })
+        .catch((err) => console.error("VFX Read: paste-image upload failed", err));
+    },
+    true
+  );
 }
 
 // ---------------------------------------------------------------------------

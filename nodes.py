@@ -154,7 +154,21 @@ def _sequence_info(path):
     # literal path to v10 still resolved and read back v11 (whatever the
     # frame widget's range happened to clamp to), never the file actually
     # named on disk. Confirmed live: this was the exact reported bug.
-    if padding < 3:
+    #
+    # An upper bound too: real frame numbers essentially never exceed 7-8
+    # digits (a 24fps shot would need to run for over a century to reach
+    # 9). The paste-from-clipboard feature names uploads
+    # "pasted_<Date.now()>.png" — a 13-digit millisecond timestamp — so
+    # two pastes made moments apart share the exact (prefix, padding,
+    # suffix) shape this matches by. Confirmed live as a real bug this
+    # cutoff alone fixes (independent of and more fundamental than the
+    # force_still flag inspect_source already has for this same feature —
+    # this one also covers the thumbnail/full-image routes, which resolve
+    # frames through this function directly and were NOT covered by
+    # force_still): a second paste got its thumbnail silently resolved to
+    # an unrelated, much larger file that happened to be "frame 1" of the
+    # bogus timestamp-shaped "sequence".
+    if padding < 3 or padding > 8:
         return None
 
     matcher = re.compile(
@@ -496,7 +510,7 @@ def _resolve_sequence_frame(
     return chosen, frames[chosen]
 
 
-def inspect_source(source_path):
+def inspect_source(source_path, force_still=False):
     source = _resolve_source(source_path)
 
     if _is_movie(source):
@@ -513,7 +527,17 @@ def inspect_source(source_path):
             "fps": info["fps"],
         }
 
-    sequence = _sequence_info(source)
+    # force_still skips sequence auto-detection entirely — used when
+    # loading a pasted-from-clipboard image (see the paste feature in
+    # read_stage1.js). Pasted uploads all land in ComfyUI's shared input/
+    # folder with a timestamp-based filename (pasted_<13 digits>.png), so
+    # two unrelated pastes made moments apart share the exact same
+    # (prefix, padding, suffix) shape that _sequence_info groups by —
+    # confirmed live: pasting a second image got the first one treated as
+    # "frame 1 of 2" of a sequence instead of two separate stills. A
+    # clipboard paste is always a one-off still; there's no sequence
+    # convention that could ever legitimately apply to it.
+    sequence = None if force_still else _sequence_info(source)
 
     if sequence:
         preview = _read_image(sequence["frames"][sequence["first"]])
