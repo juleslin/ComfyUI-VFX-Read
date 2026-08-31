@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+
+# This repo is code only — no test renders, screenshots, or footage.
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.exr
+*.tiff
+*.tif
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.gif
