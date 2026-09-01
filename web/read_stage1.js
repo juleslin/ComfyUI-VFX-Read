@@ -2607,10 +2607,18 @@ function findSelectedReadNode() {
   return null;
 }
 
-async function uploadPastedImage(blob) {
+// Shared with resolvePastedImagePath below — a chosen destination folder
+// with no filename typed still needs SOME name, and this is the exact
+// same generated-name convention the default (no destination at all)
+// upload path already uses.
+function generatePastedFilename(blob) {
   const ext = blob.type === "image/png" ? "png" : blob.type === "image/webp" ? "webp" : "jpg";
+  return `pasted_${Date.now()}.${ext}`;
+}
+
+async function uploadPastedImage(blob) {
   const form = new FormData();
-  form.append("image", blob, `pasted_${Date.now()}.${ext}`);
+  form.append("image", blob, generatePastedFilename(blob));
   form.append("type", "input");
 
   const uploadRes = await fetch("/upload/image", { method: "POST", body: form });
@@ -2738,17 +2746,22 @@ function confirmOverwriteDialog(existingPath) {
 }
 
 // Single entry point the paste handler calls: routes to the configured
-// destination (buildPasteDestRow) if both folder and filename are set,
-// prompting on a collision, or falls back to the default ComfyUI-managed
-// upload unchanged — this feature is opt-in, never a required setup step.
-// Returns the resolved path, or null if the user cancelled an overwrite
-// prompt (nothing was written).
+// destination folder (buildPasteDestRow) whenever one is set, falling
+// back to the default ComfyUI-managed upload only when NO folder is
+// configured at all — this feature is opt-in, never a required setup
+// step. Location and naming are independent: a chosen folder is always
+// honored even with no filename typed, using the same generated
+// pasted_<timestamp> name the default path uses (confirmed live as a
+// real bug otherwise — choosing a folder but leaving the name blank
+// silently ignored the folder entirely and fell back to ComfyUI's own
+// input/ directory). Returns the resolved path, or null if the user
+// cancelled an overwrite prompt (nothing was written).
 async function resolvePastedImagePath(node, blob) {
   const state = node.__vfxPreview;
   const folder = state?.pasteDestFolder?.trim();
-  const fileName = state?.pasteDestFileName?.trim();
+  const fileName = state?.pasteDestFileName?.trim() || generatePastedFilename(blob);
 
-  if (!folder || !fileName) {
+  if (!folder) {
     return uploadPastedImage(blob);
   }
 
