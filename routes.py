@@ -17,6 +17,7 @@ from .nodes import (
     inspect_source,
     is_web_displayable_image,
     list_versions,
+    resolve_hash_pattern,
     resolve_still_source,
     resolve_still_tensor,
 )
@@ -237,6 +238,28 @@ async def inspect(request):
     return web.json_response(result)
 
 
+@routes.get("/vfx-read/resolve-hash-pattern")
+async def resolve_hash_pattern_route(request):
+    """Nuke-style '####' frame placeholder support: typing/pasting
+    name.####.jpg into the file row resolves it to a real frame's path
+    here first, then loads exactly as if that concrete path had been
+    typed directly — see resolve_hash_pattern's own docstring."""
+    raw_path = request.query.get("path", "").strip()
+
+    if not raw_path:
+        raise web.HTTPBadRequest(text="Missing 'path' query parameter.")
+
+    try:
+        resolved = await run_in_executor(resolve_hash_pattern, raw_path)
+    except ValueError as error:
+        raise web.HTTPNotFound(text=str(error))
+
+    if resolved is None:
+        return web.json_response({"isPattern": False})
+
+    return web.json_response({"isPattern": True, "path": resolved})
+
+
 @routes.get("/vfx-read/versions")
 async def versions(request):
     raw_path = request.query.get("path", "").strip()
@@ -322,6 +345,67 @@ async def video(request):
     # FileResponse supports HTTP Range requests, which <video> needs for
     # seeking/scrubbing.
     return web.FileResponse(source, headers=_NO_STORE_HEADERS)
+
+
+@routes.post("/vfx-read/paste-save")
+async def paste_save(request):
+    """Saves a pasted clipboard image directly to a user-chosen destination
+    (path + file_name), instead of ComfyUI's own managed input/ folder —
+    the "save pasted screenshots to a real folder" feature. Refuses to
+    overwrite an existing file unless the caller explicitly confirms via
+    `overwrite=1` (the frontend re-POSTs with that after the user
+    confirms a collision dialog), so a same-named second paste can never
+    silently clobber the first."""
+    reader = await request.multipart()
+
+    image_bytes = None
+    raw_path = ""
+    raw_name = ""
+    overwrite = False
+
+    async for field in reader:
+        if field.name == "image":
+            image_bytes = await field.read(decode=False)
+        elif field.name == "path":
+            raw_path = (await field.text()).strip()
+        elif field.name == "file_name":
+            raw_name = (await field.text()).strip()
+        elif field.name == "overwrite":
+            overwrite = (await field.text()).strip().lower() in ("1", "true")
+
+    if not raw_path or not raw_name:
+        raise web.HTTPBadRequest(text="Missing 'path' or 'file_name'.")
+
+    if image_bytes is None:
+        raise web.HTTPBadRequest(text="Missing 'image' field.")
+
+    # file_name is a single path segment, never a nested path — otherwise
+    # "../../something" could escape the chosen destination folder
+    # entirely (Path's own '/' operator doesn't collapse '..' until
+    # resolved, so this has to be rejected explicitly up front).
+    if "/" in raw_name or "\\" in raw_name or raw_name in ("..", "."):
+        raise web.HTTPBadRequest(text="File name must not contain a path separator.")
+
+    folder = Path(raw_path)
+
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except Exception as error:
+        raise web.HTTPBadRequest(text=f"Could not create destination folder:\n{folder}\n\n{error}")
+
+    destination = folder / raw_name
+
+    if destination.exists() and not overwrite:
+        return web.json_response({"conflict": True, "path": str(destination)}, status=409)
+
+    try:
+        destination.write_bytes(image_bytes)
+    except Exception as error:
+        raise web.HTTPInternalServerError(
+            text=f"Could not save pasted image:\n{destination}\n\n{error}"
+        )
+
+    return web.json_response({"path": str(destination)})
 
 
 _UPLOAD_DIR_GETTERS = {

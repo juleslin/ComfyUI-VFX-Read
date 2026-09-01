@@ -62,6 +62,68 @@ MOVIE_EXTENSIONS = {
 
 FRAME_PATTERN = re.compile(r"^(.*?)(\d+)(\.[^.]+)$")
 
+# Nuke-style frame placeholder — a run of '#' characters in the FILENAME
+# stands in for the frame number (name.####.jpg), the number of '#'
+# characters setting the zero-padding width. Never appears in a real
+# on-disk filename, so no ambiguity with FRAME_PATTERN's own real-digit
+# matching (used for auto-detecting a sequence from an already-concrete
+# path) — this is a different, explicit entry point: paste a pattern that
+# points at no real file at all, and get resolved to one.
+_HASH_TOKEN = re.compile(r"#+")
+
+
+def resolve_hash_pattern(pattern_path):
+    """If `pattern_path`'s filename contains a run of '#' characters,
+    resolves it against real files in that folder and returns the first
+    matching frame's real path — from there, the normal
+    inspect_source/_sequence_info pipeline auto-detects the rest of the
+    sequence exactly as if that concrete path had been typed or picked
+    directly, so this only needs to hand back ONE real file, not the
+    whole range itself.
+
+    Returns None if the filename has no '#' run at all (caller should
+    treat pattern_path as a literal path instead — this only activates
+    for the explicit placeholder syntax). Raises ValueError if a '#' run
+    IS present but nothing on disk actually matches it.
+    """
+    p = Path(pattern_path.strip().strip('"')).expanduser()
+    directory = p.parent
+    filename_pattern = p.name
+
+    match = _HASH_TOKEN.search(filename_pattern)
+
+    if not match:
+        return None
+
+    start, end = match.span()
+    padding = end - start
+    prefix = filename_pattern[:start]
+    suffix = filename_pattern[end:]
+
+    matcher = re.compile(
+        "^" + re.escape(prefix) + rf"(\d{{{padding}}})" + re.escape(suffix) + "$"
+    )
+
+    found = {}
+
+    if directory.exists():
+        for candidate in directory.iterdir():
+            if not candidate.is_file():
+                continue
+
+            found_match = matcher.match(candidate.name)
+
+            if found_match:
+                found[int(found_match.group(1))] = candidate
+
+    if not found:
+        raise ValueError(
+            "No files matching this pattern were found:\n" + str(pattern_path)
+        )
+
+    first = min(found)
+    return str(found[first])
+
 
 def _resolve_source(value):
     source = Path(value.strip().strip('"')).expanduser()

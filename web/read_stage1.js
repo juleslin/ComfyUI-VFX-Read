@@ -47,6 +47,11 @@ const SCRUB_WIDGET = "$$vfx-read-scrub";
 // any more, folded into these instead.
 const FILE_ROW_WIDGET = "$$vfx-read-file-row";
 const PARAMS_ROW_WIDGET = "$$vfx-read-params-row";
+// Filename + folder icon for the paste-from-clipboard feature's own save
+// destination — purely local UI config (never a Python input, unlike
+// every other row here), so it's plain fields on state, not a widget.
+// See buildPasteDestRow / the design note above registerPasteListener.
+const PASTE_DEST_ROW_WIDGET = "$$vfx-read-paste-dest-row";
 
 const VALUE_WIDGETS = [
   "source_path",
@@ -69,6 +74,7 @@ const VALUE_WIDGETS = [
 // its position doesn't matter.
 const WIDGET_ORDER = [
   FILE_ROW_WIDGET,
+  PASTE_DEST_ROW_WIDGET,
   PARAMS_ROW_WIDGET,
   PREVIEW_WIDGET,
   VIDEO_WIDGET,
@@ -236,7 +242,13 @@ function refreshRowDisplays(node) {
   if (!state) return;
 
   if (state.fileRowInput) {
-    const v = getWidget(node, "source_path")?.value ?? "";
+    // fileRowDisplayOverride (set only by the file row's own commit
+    // handler — see buildFileRow) keeps a typed "####" pattern showing
+    // literally, even though source_path's real underlying value is the
+    // resolved concrete first frame. Every other way source_path can
+    // change (browse pick, paste, drop, version switch, restore) clears
+    // it, so this only ever applies right after typing/pasting a pattern.
+    const v = state.fileRowDisplayOverride ?? (getWidget(node, "source_path")?.value ?? "");
     if (state.fileRowInput.value !== v) state.fileRowInput.value = v;
   }
   if (state.frameRowInput) {
@@ -401,22 +413,38 @@ async function apiGet(path, params) {
   return await r.json();
 }
 
-function thumbnailUrl(sourcePath, frame) {
+// cacheBust (optional): appended as-is when the caller knows the file at
+// this exact path+frame may have changed since it was last fetched (e.g.
+// a paste that overwrites the same destination filename — same path,
+// genuinely different bytes). Server-side Cache-Control: no-store already
+// stops the HTTP cache from serving stale bytes, but confirmed live that
+// wasn't enough on its own: the browser's own in-memory image cache can
+// still short-circuit a repeat `<img>.src` assignment to an identical URL
+// without a real network round-trip. A changed query string sidesteps
+// that regardless of which cache layer is responsible. Routine scrub/
+// prefetch calls omit this, so their normal caching is untouched.
+function thumbnailUrl(sourcePath, frame, cacheBust) {
   const url = new URL("/vfx-read/thumbnail", window.location.origin);
   url.searchParams.set("path", sourcePath || "");
   if (frame !== undefined && frame !== null) {
     url.searchParams.set("frame", String(frame));
+  }
+  if (cacheBust) {
+    url.searchParams.set("_cb", String(cacheBust));
   }
   return url.toString();
 }
 
 // Full-resolution — used by the fullscreen viewer, never the small
 // preview (which stays on the deliberately-capped thumbnail route above).
-function fullImageUrl(sourcePath, frame) {
+function fullImageUrl(sourcePath, frame, cacheBust) {
   const url = new URL("/vfx-read/image", window.location.origin);
   url.searchParams.set("path", sourcePath || "");
   if (frame !== undefined && frame !== null) {
     url.searchParams.set("frame", String(frame));
+  }
+  if (cacheBust) {
+    url.searchParams.set("_cb", String(cacheBust));
   }
   return url.toString();
 }
@@ -449,7 +477,7 @@ function cacheGet(cache, path, frame) {
   return cache.map.get(cacheKey(path, frame)) || null;
 }
 
-function cacheRequest(cache, path, frame, onReady) {
+function cacheRequest(cache, path, frame, onReady, cacheBust) {
   const key = cacheKey(path, frame);
   const existing = cache.map.get(key);
   if (existing) return existing;
@@ -459,7 +487,7 @@ function cacheRequest(cache, path, frame, onReady) {
   cache.order.push(key);
   cacheTrim(cache);
 
-  cache.queue.push({ key, path, frame, entry, onReady });
+  cache.queue.push({ key, path, frame, entry, onReady, cacheBust });
   cachePump(cache);
   return entry;
 }
@@ -484,7 +512,7 @@ function cachePump(cache) {
 
     img.addEventListener("load", () => done(true), { once: true });
     img.addEventListener("error", () => done(false), { once: true });
-    img.src = thumbnailUrl(job.path, job.frame);
+    img.src = thumbnailUrl(job.path, job.frame, job.cacheBust);
   }
 }
 
@@ -578,7 +606,7 @@ function pairedRowContainer() {
 // Grey outline-folder SVG (currentColor) instead of the emoji — an emoji
 // glyph carries its own fixed color that can't be recolored via CSS; an
 // inline SVG can.
-function folderIconButton() {
+function folderIconButton(title) {
   const btn = el(
     "button",
     {
@@ -592,12 +620,55 @@ function folderIconButton() {
       alignItems: "center",
       justifyContent: "center",
     },
-    { title: "Choose source" }
+    { title: title || "Choose source" }
   );
   btn.innerHTML =
     '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">' +
     '<path d="M10 4H2v16h20V6H12l-2-2z"/></svg>';
   return btn;
+}
+
+// Reverse of resolveIfHashPattern below: given a real concrete frame path
+// (e.g. from picking a sequence in the browse dialog — see pick()),
+// replaces its trailing frame-number run with '#' characters of the same
+// width for DISPLAY only (see fileRowDisplayOverride) — the underlying
+// source_path widget still holds the real resolved path throughout,
+// nothing here changes what's actually loaded. Returns the path
+// unchanged if it has no trailing digit run before the extension at all
+// (a still with no frame number to represent as a pattern).
+function frameNumberToHashPattern(concretePath) {
+  const dot = concretePath.lastIndexOf(".");
+  const base = dot >= 0 ? concretePath.slice(0, dot) : concretePath;
+  const ext = dot >= 0 ? concretePath.slice(dot) : "";
+  const match = base.match(/(\d+)$/);
+
+  if (!match) return concretePath;
+
+  const start = base.length - match[1].length;
+  return base.slice(0, start) + "#".repeat(match[1].length) + ext;
+}
+
+// Nuke-style "####" frame placeholder: if what was just typed/pasted into
+// the file row contains a run of '#' characters, resolves it against real
+// files on disk (server-side — see resolve_hash_pattern) and returns the
+// first matching frame's real path instead. From there the normal
+// source_path pipeline (inspectAndApply/_sequence_info) auto-detects the
+// rest of the sequence exactly as if that concrete path had been typed
+// directly, so nothing downstream of this needs to know the "####" ever
+// existed. Returns the input unchanged if it has no '#' in it at all, or
+// if resolution fails for any reason (falls through to the normal
+// literal-path handling, which surfaces its own clear "not found" error).
+async function resolveIfHashPattern(rawPath) {
+  if (!rawPath.includes("#")) return rawPath;
+
+  try {
+    const result = await apiGet("/vfx-read/resolve-hash-pattern", { path: rawPath });
+    if (result.isPattern && result.path) return result.path;
+  } catch (e) {
+    console.error("VFX Read: '#' pattern resolve failed", e);
+  }
+
+  return rawPath;
 }
 
 // "File" text field + folder-icon browse button, replacing the old
@@ -611,7 +682,21 @@ function buildFileRow(node) {
   const input = rowTextInput("text");
   input.placeholder = "Choose a file...";
   input.value = getWidget(node, "source_path")?.value || "";
-  commitOnEnterOrBlur(input, () => setWidget(node, "source_path", input.value));
+  commitOnEnterOrBlur(input, async () => {
+    const typed = input.value.trim();
+    const hasHash = typed.includes("#");
+    const resolved = await resolveIfHashPattern(typed);
+
+    // A literal frame path (no '#') loads as a single still, full stop —
+    // no auto-expanding into the whole sequence just because siblings
+    // happen to exist. Only an explicit "####" pattern gets the sequence/
+    // scrub-bar treatment — same as Nuke's own convention, and why
+    // hasHash also drives whether the typed text keeps showing literally
+    // (see fileRowDisplayOverride) instead of snapping to the resolved
+    // concrete path.
+    state.fileRowDisplayOverride = hasHash ? typed : null;
+    applyResolvedSourcePath(node, resolved, !hasHash);
+  });
 
   const browseBtn = folderIconButton();
   browseBtn.addEventListener("click", () => buildBrowserDialog(node));
@@ -625,6 +710,57 @@ function buildFileRow(node) {
   widget.computeSize = (width) => [width, TRANSPORT_H];
 
   state.fileRowInput = input;
+  return widget;
+}
+
+// Filename + folder icon for where a pasted clipboard screenshot gets
+// saved — a name typed here is used EXACTLY as typed (no auto suffix/
+// prefix), and the folder icon opens a folder-only picker (see
+// buildPasteFolderDialog). Both are plain state on node.__vfxPreview, not
+// widgets — they're paste-feature UI config, never a Python input, so
+// there's nothing here for graphToPrompt to see. Left blank, pasting
+// keeps working exactly as before (uploads into ComfyUI's own input/
+// folder) — this row is opt-in, not a required setup step. Persisted via
+// onSerialize/onConfigure (see vfx_read_paste_dest) so it survives reload
+// once set.
+function buildPasteDestRow(node) {
+  const state = node.__vfxPreview;
+  const container = pairedRowContainer();
+
+  const input = rowTextInput("text");
+  input.placeholder = "(screenshotName.jpg)";
+  input.value = state.pasteDestFileName || "";
+  commitOnEnterOrBlur(input, () => {
+    state.pasteDestFileName = input.value.trim();
+  });
+
+  const browseBtn = folderIconButton();
+
+  function refreshBrowseTitle() {
+    browseBtn.title = state.pasteDestFolder
+      ? `Pasted screenshots save to: ${state.pasteDestFolder}`
+      : "Choose where pasted screenshots are saved";
+  }
+  refreshBrowseTitle();
+
+  browseBtn.addEventListener("click", () => {
+    buildPasteFolderDialog(node, (folder) => {
+      state.pasteDestFolder = folder;
+      refreshBrowseTitle();
+    });
+  });
+
+  container.appendChild(input);
+  container.appendChild(browseBtn);
+
+  const widget = node.addDOMWidget(PASTE_DEST_ROW_WIDGET, "paste-dest-row", container, {
+    serialize: false,
+  });
+  widget.computeSize = (width) => [width, TRANSPORT_H];
+
+  state.pasteDestInput = input;
+  state.pasteDestBrowseBtn = browseBtn;
+  state.refreshPasteDestBrowseTitle = refreshBrowseTitle;
   return widget;
 }
 
@@ -648,7 +784,12 @@ function buildParamsRow(node) {
     const match = versions.find(
       (v) => `v${String(v.version).padStart(2, "0")}` === versionSelect.value
     );
-    if (match) setWidget(node, "source_path", match.path);
+    if (match) {
+      // Switching versions picks a real file — no "####" pattern
+      // involved, so show it normally.
+      if (state) state.fileRowDisplayOverride = null;
+      setWidget(node, "source_path", match.path);
+    }
   });
 
   const frameInput = rowTextInput("number");
@@ -772,6 +913,14 @@ function buildPreviewWidget(node) {
     rafId: 0,
     lastTick: 0,
     acc: 0,
+    // Paste-to-a-real-folder destination — see buildPasteDestRow.
+    pasteDestFolder: "",
+    pasteDestFileName: "",
+    // Bumped whenever a reload is known to need fresh bytes at a path
+    // that may have been fetched before (see thumbnailUrl's design note).
+    cacheBust: 0,
+    // See refreshRowDisplays/buildFileRow's "####" pattern handling.
+    fileRowDisplayOverride: null,
   };
 
   const container = el("div", {
@@ -1285,7 +1434,7 @@ function showFrame(node, frame) {
       // point playback/scrubbing may already be several frames further
       // along.
       if ((state.playhead ?? f) === f) applyEntry(node, state, src, f);
-    });
+    }, state.cacheBust);
     if (entry.ready) applyEntry(node, state, src, frame);
     prefetchAround(node, state, src, frame);
   } else {
@@ -1341,7 +1490,7 @@ function directFetch(node, state, src, frame) {
     // keep last-shown frame visible
     finish();
   }, { once: true });
-  img.src = thumbnailUrl(src, frame);
+  img.src = thumbnailUrl(src, frame, state.cacheBust);
 }
 
 function applyEntry(node, state, src, frame) {
@@ -2041,6 +2190,13 @@ function buildBrowserDialog(node) {
       cacheClear(state.cache);
       state.srcW = 0;
       state.srcH = 0;
+      // A sequence picked here already collapsed into one row (see
+      // _group_files) — show it as a "####" pattern rather than the
+      // resolved first frame's literal path, matching what typing the
+      // pattern directly would show. A standalone file has no frame
+      // number to represent that way, so it shows normally.
+      state.fileRowDisplayOverride =
+        entry.kind === "sequence" ? frameNumberToHashPattern(entry.path) : null;
     }
     setWidget(node, "source_path", entry.path);
     close();
@@ -2128,6 +2284,209 @@ function buildBrowserDialog(node) {
 
   document.body.appendChild(overlay);
   load(getWidget(node, "source_path")?.value || "");
+}
+
+// ---------------------------------------------------------------------------
+// paste destination folder picker (folders only — no file to pick, this
+// chooses WHERE pasted screenshots are saved, not something to read)
+// ---------------------------------------------------------------------------
+
+function buildPasteFolderDialog(node, onChosen) {
+  const overlay = el("div", {
+    position: "fixed",
+    inset: "0",
+    background: "rgba(0,0,0,0.55)",
+    zIndex: "10000",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  });
+
+  const panel = el("div", {
+    width: "min(760px, 90vw)",
+    height: "min(560px, 85vh)",
+    background: "#232323",
+    border: "1px solid #444",
+    borderRadius: "6px",
+    display: "flex",
+    flexDirection: "column",
+    font: "12px sans-serif",
+    color: "#ddd",
+    overflow: "hidden",
+  });
+
+  const head = el("div", {
+    flex: "0 0 auto",
+    display: "flex",
+    gap: "6px",
+    padding: "8px",
+    borderBottom: "1px solid #3a3a3a",
+  });
+
+  const pathInput = el("input", {
+    flex: "1 1 auto",
+    background: "#1a1a1a",
+    border: "1px solid #444",
+    color: "#ddd",
+    padding: "4px 6px",
+    borderRadius: "3px",
+    font: "11px monospace",
+  });
+
+  const backBtn = smallBtn("←", "Back");
+  const forwardBtn = smallBtn("→", "Forward");
+  const upBtn = smallBtn("↑", "Up one level");
+
+  head.appendChild(pathInput);
+  head.appendChild(backBtn);
+  head.appendChild(forwardBtn);
+  head.appendChild(upBtn);
+
+  const list = el("div", { flex: "1 1 auto", overflowY: "auto", padding: "4px 0" });
+
+  const foot = el("div", {
+    flex: "0 0 auto",
+    display: "flex",
+    justifyContent: "flex-end",
+    gap: "6px",
+    padding: "8px",
+    borderTop: "1px solid #3a3a3a",
+  });
+
+  const cancelBtn = el("button", null, { textContent: "Cancel" });
+  const chooseBtn = el("button", null, { textContent: "Choose this folder" });
+  foot.appendChild(cancelBtn);
+  foot.appendChild(chooseBtn);
+
+  panel.appendChild(head);
+  panel.appendChild(list);
+  panel.appendChild(foot);
+  overlay.appendChild(panel);
+
+  let currentFolder = "";
+  let currentParent = "";
+  let history = [];
+  let historyIndex = -1;
+  let requestGen = 0;
+
+  function setNavEnabled(btn, enabled) {
+    btn.disabled = !enabled;
+    btn.style.opacity = enabled ? "1" : "0.4";
+    btn.style.cursor = enabled ? "pointer" : "default";
+  }
+
+  function updateNavButtons() {
+    setNavEnabled(backBtn, historyIndex > 0);
+    setNavEnabled(forwardBtn, historyIndex < history.length - 1);
+    setNavEnabled(upBtn, !!currentParent && currentParent !== currentFolder);
+  }
+
+  function close() {
+    overlay.remove();
+  }
+
+  function row(label, sub, onClick) {
+    const r = el("div", {
+      display: "flex",
+      justifyContent: "space-between",
+      gap: "10px",
+      padding: "4px 10px",
+      cursor: onClick ? "pointer" : "default",
+      whiteSpace: "nowrap",
+    });
+    const a = el("div", { overflow: "hidden", textOverflow: "ellipsis" });
+    a.textContent = label;
+    const b = el("div", { color: "#8a8a8a", flex: "0 0 auto" });
+    b.textContent = sub || "";
+    r.appendChild(a);
+    r.appendChild(b);
+    if (onClick) {
+      r.addEventListener("mouseenter", () => (r.style.background = "#2e2e2e"));
+      r.addEventListener("mouseleave", () => (r.style.background = "transparent"));
+      r.addEventListener("click", onClick);
+    }
+    list.appendChild(r);
+    return r;
+  }
+
+  async function load(dir, opts = {}) {
+    const gen = ++requestGen;
+
+    list.replaceChildren();
+    row("Loading…", "", null);
+
+    let data;
+    try {
+      // sequences:0 — directories only matter here, so skip the (CPU)
+      // file-grouping work server-side entirely, not just ignore its result.
+      data = await apiGet("/vfx-read/list", { path: dir || "", sequences: 0 });
+    } catch (e) {
+      if (gen !== requestGen) return;
+      list.replaceChildren();
+      row(`Error: ${e.message}`, "", null);
+      return;
+    }
+
+    if (gen !== requestGen) return;
+
+    currentFolder = data.folder || "";
+    currentParent = data.parent || "";
+    pathInput.value = currentFolder;
+
+    if (!opts.fromHistory) {
+      history = history.slice(0, historyIndex + 1);
+      history.push(currentFolder);
+      historyIndex = history.length - 1;
+    }
+    updateNavButtons();
+
+    list.replaceChildren();
+
+    if (data.parent && data.parent !== currentFolder) {
+      row(".. (parent)", "dir", () => load(data.parent));
+    }
+
+    for (const d of data.directories || []) {
+      row(d.name, "dir", () => load(d.path));
+    }
+
+    if (!list.children.length) row("(empty)", "", null);
+  }
+
+  backBtn.addEventListener("click", () => {
+    if (historyIndex <= 0) return;
+    historyIndex--;
+    load(history[historyIndex], { fromHistory: true });
+  });
+  forwardBtn.addEventListener("click", () => {
+    if (historyIndex >= history.length - 1) return;
+    historyIndex++;
+    load(history[historyIndex], { fromHistory: true });
+  });
+  upBtn.addEventListener("click", () => {
+    if (currentParent && currentParent !== currentFolder) load(currentParent);
+  });
+  pathInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") load(pathInput.value);
+  });
+
+  chooseBtn.addEventListener("click", () => {
+    const typed = pathInput.value.trim();
+    const folder = (typed || currentFolder).replace(/\\/g, "/").replace(/\/+$/, "");
+    if (!folder) return;
+    onChosen(folder);
+    close();
+  });
+
+  cancelBtn.addEventListener("click", close);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) close();
+  });
+  overlay.addEventListener("keydown", (e) => e.stopPropagation());
+  overlay.addEventListener("paste", (e) => e.stopPropagation());
+
+  document.body.appendChild(overlay);
+  load(node.__vfxPreview?.pasteDestFolder || getWidget(node, "source_path")?.value || "");
 }
 
 // ---------------------------------------------------------------------------
@@ -2268,6 +2627,171 @@ async function uploadPastedImage(blob) {
   return resolved.path;
 }
 
+// Saves a pasted image to a user-chosen destination (buildPasteDestRow),
+// exactly as named — no auto suffix/prefix. Returns {conflict: true, path}
+// without writing anything if the file already exists and `overwrite` is
+// false, so the caller can confirm before ever touching disk.
+async function savePastedImageToDestination(blob, folder, fileName, overwrite) {
+  const form = new FormData();
+  form.append("image", blob, fileName);
+  form.append("path", folder);
+  form.append("file_name", fileName);
+  if (overwrite) form.append("overwrite", "1");
+
+  const res = await fetch("/vfx-read/paste-save", { method: "POST", body: form });
+
+  if (res.status === 409) {
+    const data = await res.json();
+    return { conflict: true, path: data.path };
+  }
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Save failed: ${res.status} ${res.statusText}${text ? ` — ${text}` : ""}`);
+  }
+
+  const data = await res.json();
+  return { conflict: false, path: data.path };
+}
+
+// Small styled confirm dialog for a paste-destination filename collision —
+// matches the app's own dark theme rather than a jarring native confirm().
+// Resolves true (overwrite) or false (cancel, nothing written).
+function confirmOverwriteDialog(existingPath) {
+  return new Promise((resolve) => {
+    const overlay = el("div", {
+      position: "fixed",
+      inset: "0",
+      background: "rgba(0,0,0,0.55)",
+      zIndex: "10001",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+    });
+
+    const panel = el("div", {
+      width: "min(440px, 90vw)",
+      background: "#232323",
+      border: "1px solid #444",
+      borderRadius: "6px",
+      padding: "16px",
+      font: "12px sans-serif",
+      color: "#ddd",
+    });
+
+    const title = el(
+      "div",
+      { font: "13px sans-serif", marginBottom: "8px", color: "#eee" },
+      { textContent: "File already exists" }
+    );
+    const message = el(
+      "div",
+      {
+        color: "#aaa",
+        marginBottom: "16px",
+        wordBreak: "break-all",
+        font: "11px monospace",
+      },
+      { textContent: existingPath }
+    );
+
+    const foot = el("div", { display: "flex", justifyContent: "flex-end", gap: "8px" });
+    const cancelBtn = el("button", null, { textContent: "Cancel" });
+    const overwriteBtn = el(
+      "button",
+      {
+        background: "#8a3a3a",
+        color: "#fff",
+        border: "1px solid #a55",
+        borderRadius: "3px",
+        padding: "5px 12px",
+        cursor: "pointer",
+      },
+      { textContent: "Overwrite" }
+    );
+
+    foot.appendChild(cancelBtn);
+    foot.appendChild(overwriteBtn);
+
+    panel.appendChild(title);
+    panel.appendChild(message);
+    panel.appendChild(foot);
+    overlay.appendChild(panel);
+
+    function close(result) {
+      overlay.remove();
+      resolve(result);
+    }
+
+    cancelBtn.addEventListener("click", () => close(false));
+    overwriteBtn.addEventListener("click", () => close(true));
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) close(false);
+    });
+    overlay.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") close(false);
+    });
+
+    document.body.appendChild(overlay);
+  });
+}
+
+// Single entry point the paste handler calls: routes to the configured
+// destination (buildPasteDestRow) if both folder and filename are set,
+// prompting on a collision, or falls back to the default ComfyUI-managed
+// upload unchanged — this feature is opt-in, never a required setup step.
+// Returns the resolved path, or null if the user cancelled an overwrite
+// prompt (nothing was written).
+async function resolvePastedImagePath(node, blob) {
+  const state = node.__vfxPreview;
+  const folder = state?.pasteDestFolder?.trim();
+  const fileName = state?.pasteDestFileName?.trim();
+
+  if (!folder || !fileName) {
+    return uploadPastedImage(blob);
+  }
+
+  let result = await savePastedImageToDestination(blob, folder, fileName, false);
+
+  if (result.conflict) {
+    const overwrite = await confirmOverwriteDialog(result.path);
+    if (!overwrite) return null;
+    result = await savePastedImageToDestination(blob, folder, fileName, true);
+  }
+
+  return result.path;
+}
+
+// Shared by the paste handler and the file row's own "####" pattern
+// commit (see buildFileRow): sets source_path to a freshly resolved path
+// and makes sure the preview actually reloads — including the case where
+// the path is IDENTICAL to before (an intentional overwrite of the same
+// destination filename, or toggling a literal frame path back to one
+// "####" already resolved to), which setWidget's own "did the value
+// change" guard would otherwise skip entirely. forceStill: true for paste
+// (a clipboard image is always a one-off, never legitimately part of a
+// sequence) and for a literal typed frame path; false for a "####"
+// pattern, which should get normal sequence auto-detection.
+function applyResolvedSourcePath(node, path, forceStill) {
+  if (forceStill) node.__vfxForceStillNextInspect = true;
+
+  const pathChanged = getWidget(node, "source_path")?.value !== path;
+  setWidget(node, "source_path", path);
+
+  if (!pathChanged) {
+    // Same path as before — setWidget's dispatch never fires on its own,
+    // so nothing would otherwise reload. cacheBust is the other half of
+    // this: confirmed live that even a forced reload wasn't enough on its
+    // own, because the browser's own image cache short-circuited the
+    // identical thumbnail URL without a real network round-trip. See
+    // thumbnailUrl's design note.
+    const state = node.__vfxPreview;
+    if (state) state.cacheBust = Date.now();
+    onSourcePathChanged(node, path);
+  }
+}
+
 let vfxReadPasteListenerRegistered = false;
 
 function registerPasteListener() {
@@ -2320,18 +2844,17 @@ function registerPasteListener() {
       const blob = imageItem.getAsFile();
       if (!blob) return;
 
-      uploadPastedImage(blob)
+      resolvePastedImagePath(node, blob)
         .then((path) => {
-          // Pasted uploads all land in ComfyUI's shared input/ folder as
-          // pasted_<timestamp>.png — two pastes made moments apart share
-          // the exact filename shape sequence auto-detection groups by,
-          // so without this a second paste got the first treated as
-          // "frame 1 of 2" instead of two separate stills. See
-          // onSourcePathChanged/inspectAndApply's force_still plumbing.
-          node.__vfxForceStillNextInspect = true;
-          setWidget(node, "source_path", path);
+          if (!path) return; // user cancelled an overwrite prompt — nothing written
+          // A pasted screenshot is always a real concrete path with a real
+          // name — no "####" pattern involved, so the file row should show
+          // it exactly like any other normal load (see buildFileRow).
+          const state = node.__vfxPreview;
+          if (state) state.fileRowDisplayOverride = null;
+          applyResolvedSourcePath(node, path, true);
         })
-        .catch((err) => console.error("VFX Read: paste-image upload failed", err));
+        .catch((err) => console.error("VFX Read: paste-image save failed", err));
     },
     true
   );
@@ -2371,6 +2894,7 @@ app.registerExtension({
       }
 
       buildFileRow(this);
+      buildPasteDestRow(this);
       buildParamsRow(this);
 
       buildVideoWidget(this);
@@ -2404,6 +2928,16 @@ app.registerExtension({
       const r = onSerialize?.apply(this, arguments);
       try {
         o.vfx_read_values = collectValues(this);
+        // Paste-destination folder/filename — plain state, not a widget
+        // (see buildPasteDestRow), so it needs its own persistence key
+        // rather than going through collectValues/VALUE_WIDGETS.
+        const state = this.__vfxPreview;
+        if (state) {
+          o.vfx_read_paste_dest = {
+            folder: state.pasteDestFolder || "",
+            file_name: state.pasteDestFileName || "",
+          };
+        }
       } catch (e) {
         console.error("VFX Read serialize failed", e);
       }
@@ -2432,6 +2966,21 @@ app.registerExtension({
       } finally {
         this.__vfxRestoring = false;
       }
+
+      const pasteDest = o?.vfx_read_paste_dest;
+      if (pasteDest && this.__vfxPreview) {
+        const state = this.__vfxPreview;
+        state.pasteDestFolder = typeof pasteDest.folder === "string" ? pasteDest.folder : "";
+        state.pasteDestFileName = typeof pasteDest.file_name === "string" ? pasteDest.file_name : "";
+        if (state.pasteDestInput) state.pasteDestInput.value = state.pasteDestFileName;
+        state.refreshPasteDestBrowseTitle?.();
+      }
+
+      // Restored source_path is always the real resolved path (never a
+      // typed "####" pattern — that only ever lives transiently in the
+      // file row's own input, not in what gets saved), so nothing here
+      // should keep showing a stale override from before.
+      if (this.__vfxPreview) this.__vfxPreview.fileRowDisplayOverride = null;
 
       // LiteGraph's own native onConfigure (called above, before this
       // block) already did its own classic positional widgets_values
